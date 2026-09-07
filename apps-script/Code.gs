@@ -1,14 +1,19 @@
 /**
- * Daily Sheet Change Summary
+ * Daily Sheet Change Summary (standalone / read-only source)
  *
- * Compares every tracked sheet in this spreadsheet against a snapshot taken
- * the last time it ran, and emails a summary of rows added, removed, and
- * changed. Designed to run once per day via a time-driven trigger.
+ * For use when you only have VIEW access to the spreadsheet you want to
+ * watch (so a bound script can't be installed on it). This is a standalone
+ * script: it opens the source spreadsheet by ID for reading only, and
+ * keeps its own snapshots in a separate spreadsheet that it creates in
+ * your Drive (which you fully own, so writing to it is never a problem).
  *
  * Setup: see README.md in this folder.
  */
 
 const CONFIG = {
+  // The spreadsheet you want to watch. You only need view access to it.
+  sourceSpreadsheetId: '1VfQboGGRzDX2FbqWBtSes0oCVPBmW9mcNuGxLj37dkw',
+
   // Where the daily summary is sent.
   recipientEmail: 'pt1010@gmail.com',
 
@@ -22,8 +27,10 @@ const CONFIG = {
   // up as changes to every row after it).
   keyColumns: [],
 
-  // Hidden sheets used to store yesterday's data are prefixed with this.
-  snapshotPrefix: '__snapshot__',
+  // Name of the spreadsheet this script creates (in your own Drive) to
+  // store yesterday's snapshot for comparison. Created automatically on
+  // first run; its ID is then remembered in this script's properties.
+  snapshotSpreadsheetName: 'Moneytab Daily Diff Snapshots',
 
   // Hour of day (0-23, script timezone) the daily trigger fires.
   triggerHour: 7,
@@ -31,15 +38,6 @@ const CONFIG = {
   // Send an email even on days with no changes.
   sendEvenIfNoChanges: false,
 };
-
-/** Adds a menu so you can run things by hand from the Sheets UI. */
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Daily Diff')
-    .addItem('Run diff now', 'dailyDiffSummary')
-    .addItem('Enable daily email (one-time setup)', 'setupDailyTrigger')
-    .addToUi();
-}
 
 /** Run once to schedule the daily job. Safe to run again to reset the time. */
 function setupDailyTrigger() {
@@ -53,20 +51,19 @@ function setupDailyTrigger() {
     .atHour(CONFIG.triggerHour)
     .create();
 
-  SpreadsheetApp.getActiveSpreadsheet().toast(
-    `Daily diff scheduled for ~${CONFIG.triggerHour}:00 each day.`
-  );
+  Logger.log(`Daily diff scheduled for ~${CONFIG.triggerHour}:00 each day.`);
 }
 
 /** Main entry point: diff every tracked sheet and email a summary. */
 function dailyDiffSummary() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheets = getTrackedSheets(ss);
+  const sourceSs = SpreadsheetApp.openById(CONFIG.sourceSpreadsheetId);
+  const snapshotSs = getOrCreateSnapshotSpreadsheet();
+  const sheets = getTrackedSheets(sourceSs);
   const results = [];
 
   sheets.forEach((sheet) => {
     const current = readSheetData(sheet);
-    const snapshotSheet = ss.getSheetByName(CONFIG.snapshotPrefix + sheet.getName());
+    const snapshotSheet = snapshotSs.getSheetByName(sheet.getName());
     const previous = snapshotSheet ? readSheetData(snapshotSheet) : null;
 
     const diff = diffData(previous, current, CONFIG.keyColumns);
@@ -74,7 +71,7 @@ function dailyDiffSummary() {
       results.push({ sheetName: sheet.getName(), diff });
     }
 
-    saveSnapshot(ss, sheet, current);
+    saveSnapshot(snapshotSs, sheet.getName(), current);
   });
 
   if (results.length > 0) {
@@ -84,8 +81,28 @@ function dailyDiffSummary() {
   }
 }
 
+/**
+ * Returns the snapshot spreadsheet, creating it in your Drive the first
+ * time this runs and remembering its ID for next time.
+ */
+function getOrCreateSnapshotSpreadsheet() {
+  const props = PropertiesService.getScriptProperties();
+  const existingId = props.getProperty('SNAPSHOT_SPREADSHEET_ID');
+  if (existingId) {
+    try {
+      return SpreadsheetApp.openById(existingId);
+    } catch (e) {
+      // Fall through and recreate if it was deleted/moved.
+    }
+  }
+
+  const ss = SpreadsheetApp.create(CONFIG.snapshotSpreadsheetName);
+  props.setProperty('SNAPSHOT_SPREADSHEET_ID', ss.getId());
+  return ss;
+}
+
 function getTrackedSheets(ss) {
-  const all = ss.getSheets().filter((s) => !s.getName().startsWith(CONFIG.snapshotPrefix));
+  const all = ss.getSheets();
   if (CONFIG.sheetsToTrack.length === 0) return all;
   return all.filter((s) => CONFIG.sheetsToTrack.includes(s.getName()));
 }
@@ -170,12 +187,11 @@ function diffData(previous, current, keyColumns) {
   return { hasChanges, added, removed, modified, headers };
 }
 
-function saveSnapshot(ss, sheet, data) {
-  const name = CONFIG.snapshotPrefix + sheet.getName();
-  let snap = ss.getSheetByName(name);
+function saveSnapshot(snapshotSs, sheetName, data) {
+  let snap = snapshotSs.getSheetByName(sheetName);
   if (!snap) {
-    snap = ss.insertSheet(name);
-    snap.hideSheet();
+    snap = snapshotSs.insertSheet(sheetName);
+    removeDefaultPlaceholderSheet(snapshotSs);
   } else {
     snap.clear();
   }
@@ -183,6 +199,16 @@ function saveSnapshot(ss, sheet, data) {
   if (values.length > 0 && values[0].length > 0) {
     snap.getRange(1, 1, values.length, values[0].length).setValues(values);
   }
+}
+
+/** Removes the blank "Sheet1" that SpreadsheetApp.create() adds by default. */
+function removeDefaultPlaceholderSheet(ss) {
+  const sheets = ss.getSheets();
+  if (sheets.length <= 1) return;
+  const placeholder = sheets.find(
+    (s) => s.getName() === 'Sheet1' && s.getLastRow() === 0 && s.getLastColumn() === 0
+  );
+  if (placeholder) ss.deleteSheet(placeholder);
 }
 
 function escapeHtml(value) {
